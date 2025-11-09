@@ -14,7 +14,6 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 def run_command(command, timeout=60):
     try:
-        # capture_output=True ensures non-interactive mode to prevent hangs
         result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=timeout, cwd=PROJECT_DIR)
         return {"success": True, "output": result.stdout.strip()}
     except subprocess.TimeoutExpired: return {"success": False, "error": "Command timed out."}
@@ -33,33 +32,32 @@ def deploy():
 def backup():
     if DB_PASSWORD == "CHANGE_ME": return "SECURITY RISK: Change default password first.", 400
     host_path = os.path.join(UPLOAD_FOLDER, f"backup_{int(time.time())}.gz")
-    # CRITICAL FIX: Direct stream to host file, forced IPv4 (127.0.0.1)
     cmd = f"docker exec my-mongo-db mongodump --host 127.0.0.1 --username=root --password={shlex.quote(DB_PASSWORD)} --authenticationDatabase=admin --archive --gzip"
     try:
         with open(host_path, 'wb') as f:
             subprocess.run(cmd, shell=True, check=True, stdout=f, stderr=subprocess.PIPE, timeout=120)
         return send_file(host_path, as_attachment=True, download_name="mongo_backup.gz", mimetype="application/gzip")
-    except Exception as e: return f"Error: {str(e)}", 500
+    except Exception as e: return f"Dump failed: {str(e)}", 500
     finally:
-        if os.path.exists(host_path):
-             time.sleep(1)
-             try: os.remove(host_path)
-             except: pass
+        if os.path.exists(host_path): time.sleep(1); try: os.remove(host_path); except: pass
 
 @app.route('/restore', methods=['POST'])
 def restore():
     file = request.files.get('backupFile')
-    if not file or file.filename == '': return jsonify({"success": False, "error": "No file."}), 400
-    host_path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
+    if not file: return jsonify({"success": False, "error": "No file."}), 400
+    host_path = os.path.join(UPLOAD_FOLDER, secure_filename(f"restore_{int(time.time())}_{file.filename}"))
     try:
         file.save(host_path)
-        if not run_command(f"docker cp {host_path} my-mongo-db:/tmp/restore.gz", timeout=60)["success"]: return jsonify({"success": False, "error": "Copy failed."}), 500
-        # CRITICAL FIX: Restore from internal path, forced IPv4
-        restore_cmd = f"docker exec my-mongo-db mongorestore --host 127.0.0.1 --username=root --password={shlex.quote(DB_PASSWORD)} --authenticationDatabase=admin --archive=/tmp/restore.gz --gzip --drop"
-        return jsonify(run_command(restore_cmd, timeout=300))
+        # CRITICAL FIX: Added --authenticationDatabase=admin
+        cmd = f"docker exec -i my-mongo-db mongorestore --host 127.0.0.1 --username=root --password={shlex.quote(DB_PASSWORD)} --authenticationDatabase=admin --archive --gzip --drop"
+        with open(host_path, 'rb') as f:
+            subprocess.run(cmd, shell=True, check=True, stdin=f, capture_output=True, timeout=300)
+        return jsonify({"success": True, "output": "Restore complete."})
+    except subprocess.CalledProcessError as e:
+         return jsonify({"success": False, "error": e.stderr if e.stderr else str(e)}), 500
+    except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
     finally:
         if os.path.exists(host_path): os.remove(host_path)
-        run_command("docker exec my-mongo-db rm -f /tmp/restore.gz", timeout=10)
 
 @app.route('/logs', methods=['GET'])
 def logs(): return jsonify(run_command("docker compose logs --tail=100", timeout=10))
@@ -76,5 +74,4 @@ def get_status():
         return jsonify({"success": True, "status": res.stdout.strip()})
     except: return jsonify({"success": True, "status": "not_deployed"})
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+if __name__ == '__main__': app.run(host='0.0.0.0', port=5000, debug=False)
